@@ -6,6 +6,8 @@ from scipy.constants import c as c0
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
+WAVELENGTH = 1.55e-6
+
 @dataclass(frozen=True)
 class SOAParameters:
     #TODO: fix units to more reasonable choices (such as um for lengths)
@@ -134,11 +136,6 @@ if __name__ == "__main__":
         L=500e-6,
     )
 
-    # P = 1e-3
-    # S0 = params.get_S0_from_P(P, 1.55e-6)
-    # print(S0)
-
-    # print(params.C2()*S0)
 
     print("================================================")
     print("Testing constants")
@@ -157,60 +154,30 @@ if __name__ == "__main__":
         raise ValueError("C2 is not finite")
 
     print("\n================================================")
-    print("Single-point solve")
+    print("Curve test")
     print("================================================")
 
-    lamda = 1.55e-6
 
-    S0 = params.get_S0_from_P(1e-3, 1.55e-6)
+    Pins = np.linspace(0.5e-3, 3.5e-3, 12)
+    S0s = [params.get_S0_from_P(P, WAVELENGTH) for P in Pins]
 
-    G_num = solve_gain(S0, params)
+    try:
+        Gs = calc_curve(S0s, params)
 
-    print(f"\nGain for S0={S0:.3e}: G={G_num:.6e}")
-
-    Gs = np.logspace(-2, np.log10(params.G_small_signal()), 50)
-    Ps = np.logspace(-9,0,10)
-    S0s = params.get_S0_from_P(Ps, lamda)
-
-    C1 = params.C1()
-    C2 = params.C2()
-    alpha = params.alpha_int
-
-    plt.figure()
-    for S0, P in zip(S0s,Ps):
-        fs = [f(G, S0, params) for G in Gs]
-        G_calc = solve_gain(S0, params)
-        print(f"Gain for {P}: {G_calc}")
-        plt.axvline(G_calc)
-        plt.semilogx(Gs, fs, label=f"{S0:.2}")
-    plt.grid()
-    plt.legend()
-    plt.show()
+        for P, s, g in zip(Pins, S0s, Gs):
+            print(f"P = {P:.2} S0 = {s:.3e}   G = {g:.6e}")
 
 
-    # print("\n================================================")
-    # print("Curve test")
-    # print("================================================")
+        # Basic sanity checks
+        if np.any(~np.isfinite(Gs)):
+            raise ValueError("Non-finite gains detected")
 
-    # S0s = np.logspace(14, 20, 10)
+        if np.any(Gs <= 0):
+            raise ValueError("Non-positive gains detected")
 
-    # try:
-    #     Gs = calc_curve(S0s, params)
+        print("\nCurve computed successfully:\n")
+        print("\nAll tests passed.")
 
-    #     print("\nCurve computed successfully:\n")
-
-    #     for s, g in zip(S0s, Gs):
-    #         print(f"S0 = {s:.3e}   G = {g:.6e}")
-
-    #     # Basic sanity checks
-    #     if np.any(~np.isfinite(Gs)):
-    #         raise ValueError("Non-finite gains detected")
-
-    #     if np.any(Gs <= 0):
-    #         raise ValueError("Non-positive gains detected")
-
-    #     print("\nAll tests passed.")
-
-    # except Exception as e:
-    #     print("\nCurve computation failed:")
-    #     print(e)
+    except Exception as e:
+        print("\nCurve computation failed:")
+        print(e)
