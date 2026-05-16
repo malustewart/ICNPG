@@ -10,9 +10,6 @@ WAVELENGTH = 1.55e-6
 
 @dataclass(frozen=True)
 class SOAParameters:
-    #TODO: fix units to more reasonable choices (such as um for lengths)
-    # Electrical
-    I: float              # Injection current [A]
 
     # Carrier dynamics
     tau_sp: float         # Spontaneous lifetime [s]
@@ -29,16 +26,15 @@ class SOAParameters:
     d: float              # Active layer thickness [m]
     L: float              # Length [m]
 
-    def C1(self):
+    def C1(self, I):
         return (
-            self.I * self.tau_sp * self.Gamma * self.a
+            I * self.tau_sp * self.Gamma * self.a
             / (q * self.W * self.d * self.L)
             - self.n0 * self.Gamma * self.a
             - self.alpha_int
         )
 
     def C2(self):
-
         return (
             self.tau_sp
             * self.Gamma
@@ -46,20 +42,20 @@ class SOAParameters:
             * self.a
         )
     
-    def G_small_signal(self):
-        return np.exp(self.C1() * self.L)
+    def G_small_signal(self, I):
+        return np.exp(self.C1(I) * self.L)
 
-    def G_inflection(self, S0):
-        return self.C1()/self.C2()/S0/self.alpha_int
+    def G_inflection(self, S0, I):
+        return self.C1(I)/self.C2()/S0/self.alpha_int
 
     def get_S0_from_P(self, P, lamda0):
         nu = c0/lamda0
         return P/(self.W * self.d * h * nu * self.vg)
 
 # Transcendental equation find root of
-def f(G:float, S0:float, p:SOAParameters):
+def f(G:float, S0:float, I:float, p:SOAParameters):
 
-    C1 = p.C1()
+    C1 = p.C1(I)
     C2 = p.C2()
 
     numerator = (
@@ -86,15 +82,15 @@ def f(G:float, S0:float, p:SOAParameters):
         * np.log(np.abs(numerator / denominator))
     )
 
-def solve_gain(S0, p: SOAParameters):
+def solve_gain(S0, I, p: SOAParameters):
     """
     Cálculo de G a partir de parámetros del SOA y la potencia de entrada S0:
     """
 
-    f_wrapper = lambda G: f(G,S0,p)
+    f_wrapper = lambda G: f(G,S0,I,p)
 
     # Solve f(G)=0
-    G_max = params.G_inflection(S0)
+    G_max = params.G_inflection(S0, I)
     solution = root_scalar(
         f_wrapper,
         bracket=[1e-1, G_max],
@@ -108,11 +104,11 @@ def solve_gain(S0, p: SOAParameters):
 
     return solution.root
 
-def calc_curve(S0s: np.ndarray, params : SOAParameters):
+def calc_curve(S0s: np.ndarray, I: float, params : SOAParameters):
     """
     Cálculo de G a partir de parámetros del SOA para un conjunto de potencias de entrada S0:
     """
-    Gs = [solve_gain(S0, params) for S0 in S0s]
+    Gs = [solve_gain(S0, I, params) for S0 in S0s]
     return np.array(Gs)
 
 
@@ -122,9 +118,10 @@ def calc_curve(S0s: np.ndarray, params : SOAParameters):
 
 if __name__ == "__main__":
 
+    I=0.15              # 150 mA
+
     # Reasonable-ish SOA parameters
     params = SOAParameters(
-        I=0.15,              # 150 mA
         tau_sp=1e-9,
         n0=1e24,
         Gamma=0.3,
@@ -141,7 +138,7 @@ if __name__ == "__main__":
     print("Testing constants")
     print("================================================")
 
-    C1 = params.C1()
+    C1 = params.C1(I)
     C2 = params.C2()
 
     print(f"C1 = {C1:.6e}")
@@ -162,7 +159,7 @@ if __name__ == "__main__":
     S0s = [params.get_S0_from_P(P, WAVELENGTH) for P in Pins]
 
     try:
-        Gs = calc_curve(S0s, params)
+        Gs = calc_curve(S0s, I, params)
 
         for P, s, g in zip(Pins, S0s, Gs):
             print(f"P = {P:.2} S0 = {s:.3e}   G = {g:.6e}")
