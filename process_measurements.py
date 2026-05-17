@@ -13,7 +13,8 @@ from scipy.interpolate import griddata
 DATA_FOLDER = Path("measurement")
 
 # Output dataset
-OUTPUT_CSV = DATA_FOLDER/"processed/soa_gain_dataset.csv"
+MEASUREMENT_CSV = DATA_FOLDER/"processed/soa_gain_dataset.csv"
+INTERPOLATED_GRID_NPZ = DATA_FOLDER/"processed/soa_2d_gain_map.npz"
 
 OUTPUT_KEY = "CH1"
 INPUT_KEY = "CH2"
@@ -69,13 +70,13 @@ def plot_gain_vs_Pout(gain, Pout, I):
     plt.ylabel("Gain (linear)")
     plt.title(f"Gain vs. P_out - I_soa: {I}mA")
 
-def create_soa_gain_dataset(data_folder, outfile=None):
+def create_soa_gain_dataset_from_npz(data_folder, outfile=None):
     rows = []
 
-    files = sorted(DATA_FOLDER.glob("*.npz"))
+    files = sorted(data_folder.glob("*.npz"))
 
     if not files:
-        raise RuntimeError(f"No .npz files found in: {DATA_FOLDER}")
+        raise RuntimeError(f"No .npz files found in: {data_folder}")
 
     for file in files:
 
@@ -138,7 +139,78 @@ def create_soa_gain_dataset(data_folder, outfile=None):
     
     return df
 
-def interpolate_soa_gain_to_grid(currents, pin, gain, outdir="."):
+
+def create_soa_gain_dataset(data_folder, outfile=None):
+    rows = []
+
+    files = sorted(data_folder.glob("*.csv"))
+
+    if not files:
+        raise RuntimeError(f"No .csv files found in: {data_folder}")
+
+    for file in files:
+
+        current_mA = extract_current_mA(file.name)
+        data = np.loadtxt(file, delimiter=",", skiprows=1) #skip header
+        v_in = np.asarray(data[:,1], dtype=float)[:-4]
+        v_out = np.asarray(data[:,0], dtype=float)[:-4]
+        v_in = savgol_filter(v_in, 500, 3)
+        v_out = savgol_filter(v_out, 500, 3)
+        v_out -= np.min(v_out) # remove amplified spontaneous emissions output power
+        
+        # --------------------------------------------------------
+        # Convert from V to power
+        # --------------------------------------------------------
+
+        p_in = v_in / pd_input_R / scope_zin / tap_input_T_to_scope * tap_input_T_to_soa
+        p_out = v_out / pd_output_R /scope_zin / tbf_loss
+        valid = (
+            np.isfinite(p_in)
+            & np.isfinite(p_out)
+            & (p_in > 0)
+            & (p_out > 0)
+        )
+        p_in = p_in[valid]
+        p_out = p_out[valid]
+
+        # --------------------------------------------------------
+        # Compute gain
+        # --------------------------------------------------------
+
+        g_lin = linear_gain(p_out, p_in)
+        g_db = gain_dB(p_out, p_in)
+
+        # --------------------------------------------------------
+        # Store rows
+        # --------------------------------------------------------
+
+        for pin, pout, glin, gdb in zip(p_in, p_out, g_lin, g_db):
+
+            rows.append(
+                {
+                    "soa_current_mA": current_mA,
+                    "input_power_W": pin,
+                    "output_power_W": pout,
+                    "gain_linear": glin,
+                    "gain_dB": gdb,
+                }
+            )
+
+    df = pd.DataFrame(rows)
+
+    # Sort nicely
+    df = df.sort_values(
+        by=["soa_current_mA", "input_power_W"]
+    ).reset_index(drop=True)
+
+    # Save
+    if outfile:
+        df.to_csv(outfile, index=False)
+    
+    return df
+
+
+def interpolate_soa_gain_to_grid(currents, pin, gain, outfile_npz=None):
 
     current_grid = np.array([60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320])
 
@@ -159,13 +231,14 @@ def interpolate_soa_gain_to_grid(currents, pin, gain, outdir="."):
 
     G_dB = 10 * np.log10(G)
 
-    np.savez(
-        f"{outdir}/soa_2d_gain_map.npz",
-        soa_current_mA=current_grid,
-        input_power_W=pin_grid,
-        gain_linear=G,
-        gain_dB=G_dB,
-    )
+    if outfile_npz:
+        np.savez(
+            outfile_npz,
+            soa_current_mA=current_grid,
+            input_power_W=pin_grid,
+            gain_linear=G,
+            gain_dB=G_dB,
+        )
 
     return current_grid, pin_grid, G, G_dB
 
@@ -226,23 +299,19 @@ def plot_gain_grid(current_grid, pin_grid, G, G_dB, outdir=".", linear_filename=
 
 
 if __name__ == '__main__':
-    outfile = OUTPUT_CSV
-    
-    df = create_soa_gain_dataset("measurement", outfile)
+    df = create_soa_gain_dataset(DATA_FOLDER, MEASUREMENT_CSV)
 
     print("\n================================================")
-    print(f"Saved dataset to: {outfile}")
+    print(f"Saved dataset to: {MEASUREMENT_CSV}")
     print("================================================")
-
 
     # remove numerically unstable cases
     filtered_df = df.loc[(df['input_power_W'] >= 0.5e-3) & (df['gain_linear'] <= 100)]
-
 
     soa_current_mA = filtered_df["soa_current_mA"].values
     pin = filtered_df["input_power_W"].values
     gain_linear = filtered_df["gain_linear"].values
 
-    current_grid, pin_grid, G, G_dB = interpolate_soa_gain_to_grid(soa_current_mA, pin, gain_linear, outdir="measurement/processed")
+    current_grid, pin_grid, G, G_dB = interpolate_soa_gain_to_grid(soa_current_mA, pin, gain_linear, outfile_npz=INTERPOLATED_GRID_NPZ)
 
-    plot_gain_grid(current_grid, pin_grid, G, G_dB, outdir="measurement/processed")
+    plot_gain_grid(current_grid, pin_grid, G, G_dB, outdir=DATA_FOLDER/"processed")
