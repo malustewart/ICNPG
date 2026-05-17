@@ -91,18 +91,46 @@ def solve_gain(S0, I, p: SOAParameters):
 
     # Solve f(G)=0
     G_max = p.G_inflection(S0, I)
+    x0 = G_max / 10
     solution = root_scalar(
         f_wrapper,
         bracket=[1e-1, G_max],
         method="secant",
-        x0=G_max/10
+        x0=x0
     )
 
-    if not solution.converged or solution.root < 0:
-        print("Root method did not converge")
-        return np.nan
+    if solution.converged and solution.root > 0:
+        return solution.root
+    
+    # Try again with different conditions
+    G_max = p.G_inflection(S0, I)/10
+    x0 = G_max / 10
+    solution = root_scalar(
+        f_wrapper,
+        bracket=[1e-1, G_max],
+        method="secant",
+        x0=x0
+    )
 
-    return solution.root
+    if solution.converged and solution.root > 0:
+        return solution.root
+
+    # Try again with different conditions
+    G_max = p.G_inflection(S0, I)
+    x0 = G_max / 2
+    solution = root_scalar(
+        f_wrapper,
+        bracket=[1e-1, G_max],
+        method="secant",
+        x0=x0
+    )
+
+    if solution.converged and solution.root > 0:
+        return solution.root
+
+    return np.nan
+
+
 
 def calc_gain_curve(S0s: np.ndarray, I: float, params : SOAParameters):
     """
