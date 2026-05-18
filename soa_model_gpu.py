@@ -4,6 +4,7 @@ from scipy.constants import h
 from scipy.constants import c as c0
 import matplotlib.pyplot as plt
 from numba import cuda
+import numpy as np
 
 WAVELENGTH = 1.55e-6
 
@@ -44,11 +45,11 @@ def C2(tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
 
 @cuda.jit(device=True)
 def G_small_signal(I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
-    return math.exp(C1(I) * L)
+    return math.exp(C1(I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L) * L)
 
 @cuda.jit(device=True)
 def G_inflection(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
-    return C1(I)/C2()/S0/alpha_int
+    return C1(I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)/C2(tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)/S0/alpha_int
 
 def get_S0_from_P(P, lamda0, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
     nu = c0/lamda0
@@ -58,32 +59,238 @@ def get_S0_from_P(P, lamda0, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
 @cuda.jit(device=True)
 def f(G:float, S0:float, I:float, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
 
-    C1 = C1(I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
-    C2 = C2(tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
+    c1 = C1(I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
+    c2 = C2(tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
 
     numerator = (
-        C1
-        - alpha_int * C2 * S0
+        c1
+        - alpha_int * c2 * S0
     )
 
     denominator = (
-        C1
-        - alpha_int * C2 * G * S0
+        c1
+        - alpha_int * c2 * G * S0
     )
 
     # Invalid logarithm region
-    if math.abs(denominator) <= 1e-12:
+    if abs(denominator) <= 1e-12:
         return math.nan
 
     return (
-        C1 * L
-        - math.log(math.abs(G))
+        c1 * L
+        - math.log(abs(G))
         - (
-            (alpha_int + C1)
+            (alpha_int + c1)
             / alpha_int
         )
-        * math.log(math.abs(numerator / denominator))
+        * math.log(abs(numerator / denominator))
     )
+
+@cuda.jit(device=True)
+def solve_gain(
+    S0,
+    I,
+
+    tau_sp,
+    n0,
+    Gamma,
+    a,
+    alpha_int,
+    vg,
+    W,
+    d,
+    L,
+):
+
+    x1 = G_inflection(
+        S0,
+        I,
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+    )
+
+    x0 = x1/100
+
+    f0 = f(
+        x0,
+        S0,
+        I,
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+    )
+
+    f1 = f(
+        x1,
+        S0,
+        I,
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+    )
+
+    if math.isnan(f0) or math.isnan(f1):
+        return math.nan
+
+    for _ in range(64):
+
+        denom = (f1 - f0)
+
+        # avoid division by zero
+        if abs(denom) < 1e-14:
+            return math.nan
+
+        x2 = x1 - f1 * (x1 - x0) / denom
+
+        f2 = f(
+            x2,
+            S0,
+            I,
+            tau_sp,
+            n0,
+            Gamma,
+            a,
+            alpha_int,
+            vg,
+            W,
+            d,
+            L,
+        )
+
+        if math.isnan(f2):
+            return math.nan
+
+        # convergence test
+        if abs(f2) < 1e-10:
+            return x2
+
+        # shift iteration
+        x0 = x1
+        f0 = f1
+
+        x1 = x2
+        f1 = f2
+
+    return x1
+
+@cuda.jit
+def calc_gain_matrix_kernel(
+    S0s,
+    Is,
+    G_out,
+
+    tau_sp,
+    n0,
+    Gamma,
+    a,
+    alpha_int,
+    vg,
+    W,
+    d,
+    L,
+):
+
+    i, j = cuda.grid(2)
+
+    if i >= Is.size or j >= S0s.size:
+        return
+
+    S0 = S0s[j]
+    I  = Is[i]
+
+    G = solve_gain(
+        S0,
+        I,
+
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+    )
+
+    G_out[i, j] = G
+
+def calc_gain_matrix(
+    S0s,
+    Is,
+
+    tau_sp,
+    n0,
+    Gamma,
+    a,
+    alpha_int,
+    vg,
+    W,
+    d,
+    L,
+):
+    G_out = np.empty(
+        (Is.size, S0s.size),
+        dtype=np.float64
+    )
+    d_S0s = cuda.to_device(S0s)
+    d_Is  = cuda.to_device(Is)
+
+    d_G_out = cuda.device_array(
+        G_out.shape,
+        dtype=np.float64
+    )
+    threads_per_block = (16, 16)
+
+    blocks_x = (Is.size + 15) // 16
+    blocks_y = (S0s.size + 15) // 16
+
+    blocks_per_grid = (
+        blocks_x,
+        blocks_y,
+    )
+
+    calc_gain_matrix_kernel[
+        blocks_per_grid,
+        threads_per_block
+    ](
+        d_S0s,
+        d_Is,
+        d_G_out,
+
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+    )
+
+    cuda.synchronize()
+
+    return d_G_out.copy_to_host()
 
 # def solve_gain(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
 #     """
@@ -167,31 +374,13 @@ if __name__ == "__main__":
         500e-6  #L [m]
     )
 
-
-
-    print("================================================")
-    print("Testing constants")
+    print("\n================================================")
+    print("Curve test")
     print("================================================")
 
-    c1 = C1(I, *soa_params)
-    c2 = C2(I, *soa_params)
 
-    print(f"C1 = {c1:.6e}")
-    print(f"C2 = {c2:.6e}")
-
-    if not math.isfinite(c1):
-        raise ValueError("C1 is not finite")
-
-    if not math.isfinite(c2):
-        raise ValueError("C2 is not finite")
-
-    # print("\n================================================")
-    # print("Curve test")
-    # print("================================================")
-
-
-    # Pins = np.linspace(2.2e-3, 2.4e-3, 12)
-    # S0s = [params.get_S0_from_P(P, WAVELENGTH) for P in Pins]
+    Pins = np.linspace(2.2e-3, 2.4e-3, 12)
+    S0s = [get_S0_from_P(P, WAVELENGTH, *soa_params) for P in Pins]
 
     # try:
     #     Gs = calc_gain_curve(S0s, I, params)
