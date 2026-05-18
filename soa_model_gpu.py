@@ -1,3 +1,4 @@
+%%writefile soa_parameter_inference/soa_model_gpu.py
 import math
 from scipy.constants import elementary_charge as q  # carga del electron
 from scipy.constants import h
@@ -5,6 +6,7 @@ from scipy.constants import c as c0
 import matplotlib.pyplot as plt
 from numba import cuda
 import numpy as np
+from optimization_gpu import cost, count_nan
 
 WAVELENGTH = 1.55e-6
 
@@ -292,65 +294,188 @@ def calc_gain_matrix(
 
     return d_G_out.copy_to_host()
 
-# def solve_gain(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L):
-#     """
-#     Cálculo de G a partir de parámetros del SOA y la potencia de entrada S0:
-#     """
+@cuda.jit
+def calc_gain_matrix_param_sweep_kernel(
+    S0s,
+    Is,
+    tau_sp,
+    n0,
+    Gamma,  #array
+    a,      #array
+    alpha_int,
+    vg,
+    W,  #array
+    d,  #array
+    L,
 
-#     f_wrapper = lambda G: f(G,S0,I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
+    # outputs
+    G_out,
+    nan_mask,
+):
 
-#     # Solve f(G)=0
-#     G_max = G_inflection(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
-#     x0 = G_max / 10
-#     solution = root_scalar(
-#         f_wrapper,
-#         bracket=[1e-1, G_max],
-#         method="secant",
-#         x0=x0
-#     )
+    p_idx, i_idx, s_idx = cuda.grid(3)
 
-#     if solution.converged and solution.root > 0:
-#         return solution.root
+    if (
+        p_idx >= G_out.shape[0]
+        or i_idx >= G_out.shape[1]
+        or s_idx >= G_out.shape[2]
+    ):
+        return
+
+    S0 = S0s[s_idx]
+    I  = Is[i_idx]
+
+    G = solve_gain(
+        S0,
+        I,
+
+        tau_sp,
+        n0,
+        Gamma[p_idx],
+        a[p_idx],
+        alpha_int,
+        vg,
+        W[p_idx],
+        d,
+        L[p_idx],
+    )
+
+    G_out[p_idx, i_idx, s_idx] = G
+
+    nan_mask[p_idx, i_idx, s_idx] = math.isnan(G)
+
+@cuda.jit
+def calc_cost_from_gain_matrix_param_sweep_kernel(
+    calc_G,
+    real_G,
+    S0s,
+    Is,
+    costs,
+    nan_counts,
+):
+
+    p_idx = cuda.grid(1)
     
-#     # Try again with different conditions
-#     G_max = G_inflection(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)/10
-#     x0 = G_max / 10
-#     solution = root_scalar(
-#         f_wrapper,
-#         bracket=[1e-1, G_max],
-#         method="secant",
-#         x0=x0
-#     )
+    if p_idx >= costs.size:
+        return
 
-#     if solution.converged and solution.root > 0:
-#         return solution.root
+    N_I = len(Is)
+    N_S0 = len(S0s)
+    
+    costs[p_idx] = cost(real_G, calc_G[p_idx])
+    nan_counts[p_idx] = count_nan(calc_G[p_idx])
 
-#     # Try again with different conditions
-#     G_max = G_inflection(S0, I, tau_sp, n0, Gamma, a, alpha_int, vg, W, d, L)
-#     x0 = G_max / 2
-#     solution = root_scalar(
-#         f_wrapper,
-#         bracket=[1e-1, G_max],
-#         method="secant",
-#         x0=x0
-#     )
-
-#     if solution.converged and solution.root > 0:
-#         return solution.root
-
-#     return math.nan
+    #optional: penalize cost with nan_count
 
 
+def calc_cost_param_sweep(
+    S0s,
+    Is,
+    tau_sp,
+    n0,
+    Gamma,  #array
+    a,      #array
+    alpha_int,
+    vg,
+    W,  #array
+    d,  #array
+    L,
+    real_G,
+    costs, # for returning output
+    nan_counts = None  # for returning output
+):
+    N_params = len(Gamma)
+    N_I = len(Is)
+    N_S0 = len(S0s)
 
-# def calc_gain_curve(S0s: np.ndarray, I: float, params : SOAParameters):
-#     """
-#     Cálculo de G a partir de parámetros del SOA para un conjunto de potencias de entrada S0:
-#     """
-#     Gs = [solve_gain(S0, I, params) for S0 in S0s]
-#     return np.array(Gs)
+    d_G_out = cuda.device_array(
+        (N_params, N_I, N_S0),
+        dtype=np.float64,
+    )
 
-# def calc_gain_matrix(S0s: np.ndarray, Is: np.ndarray, params: SOAParameters):
-#     return np.array([[solve_gain(S0, I, params) for S0 in S0s] for I in Is])
+    # Currently this matrix is not really useful
+    # but is left because it can be used to debug 
+    # for which param combos the gain estimation fails
+    # (ie.: not only the number of fails but its positions)
+    d_nan_mask = cuda.device_array(
+        (N_params, N_I, N_S0),
+        dtype=np.bool_,
+    )
+
+    d_costs = cuda.device_array(
+        N_params,
+        dtype=np.float64,
+    )
+
+    d_nan_counts = cuda.device_array(
+        N_params,
+        dtype=np.float64,
+    )
+
+    d_S0s = cuda.to_device(S0s)
+    d_Is = cuda.to_device(Is)
+    d_real_G = cuda.to_device(real_G)
+
+    d_Gamma_vals = cuda.to_device(Gamma)
+    d_a_vals = cuda.to_device(a)
+    d_W_vals = cuda.to_device(W)
+    d_d_vals = cuda.to_device(d)
+
+    # launch first kernel to calc gains for all param combinations
+    # divide threads in 3D: (param_combination, I, S0)
+
+    threads_per_block = (4, 8, 8)   # 256 threads per block
+
+    blocks_per_grid = (
+        (N_params + threads_per_block[0] - 1) // threads_per_block[0],
+        (N_I + threads_per_block[1] - 1) // threads_per_block[1],
+        (N_S0 + threads_per_block[2] - 1) // threads_per_block[2],
+    )
+    calc_gain_matrix_param_sweep_kernel[
+        blocks_per_grid,
+        threads_per_block
+    ](
+        #inputs
+        d_S0s,
+        d_Is,
+
+        tau_sp,
+        n0,
+        Gamma,
+        a,
+        alpha_int,
+        vg,
+        W,
+        d,
+        L,
+        
+        d_G_out,
+        d_nan_mask
+    )
+
+    cuda.synchronize()
+
+    # launch second kernel to calculate the cost function for all parameter combinations
+    # divide threads in 1D: (param_combination)
+    threads_per_block = (256,)
+    blocks_per_grid = (
+        (N_params + threads_per_block[0] - 1), # threads_per_block[0],
+    )
+    calc_cost_from_gain_matrix_param_sweep_kernel[
+        threads_per_block,
+        blocks_per_grid
+    ](
+        d_G_out,
+        d_real_G,
+        d_S0s,
+        d_Is,
+        d_costs,
+        d_nan_counts,
+    )
+
+    d_costs.copy_to_host(costs)
+    if nan_counts:
+        d_nan_counts.copy_to_host(nan_counts)
 
 
 # ============================================================
@@ -358,11 +483,10 @@ def calc_gain_matrix(
 # ============================================================
 
 if __name__ == "__main__":
-
     I=0.300              # [A]
 
     # Reasonable-ish SOA parameters
-    soa_params = (
+    soa_params = [
         1e-9,   #tau_sp [s]
         1e24,   #n0
         0.3,    #Gamma
@@ -372,55 +496,80 @@ if __name__ == "__main__":
         2e-6,   #W [m]
         0.2e-6, #d [m]
         500e-6  #L [m]
-    )
+    ]
 
-    print("\n================================================")
-    print("Curve test")
-    print("================================================")
+    gain_map = np.load('measurement/processed/soa_2d_gain_map.npz')
+
+    Is = gain_map["soa_current_mA"] * 1e-3
+    Pins = gain_map["input_power_W"]
+    gain = gain_map["gain_linear"]
+
+    # fix dataset with numerical errors at edges that include nan
+    Pin_range = slice(1,len(Pins) - 1)
+    Is_range = slice(4,len(Is))
+
+    gain = gain[Is_range, Pin_range].copy() #copy is necessary so that memory is contiguous (which does not happen if working with view)
+    Is = Is[Is_range].copy()
+    Pins = Pins[Pin_range].copy()
+    S0s = get_S0_from_P(Pins, WAVELENGTH, *soa_params)
+
+    a_range = np.logspace(-19.52, -19.52, 1)
+    gamma_range = np.logspace(-1, -0.1, 3)
+    W_range = np.logspace(-6, -5, 3)
+    L_range = np.logspace(-4, -3, 3)
+
+    a_s, Ws, Ls, gammas = np.meshgrid(a_range, W_range, L_range, gamma_range, indexing="ij") # indexing: [a,W,L,gamma]
+
+    a_s = a_s.flatten()
+    Ws = Ws.flatten()
+    Ls = Ls.flatten()
+    gammas = gammas.flatten()
+
+    print(gammas)
+
+    costs = np.zeros_like(Ws)
+    nan_counts = np.zeros_like(Ws)
+
+    soa_params[2] = gammas
+    soa_params[3] = a_s
+    soa_params[6] = Ws
+    soa_params[8] = Ls
 
 
-    Pins = np.linspace(2.2e-3, 2.4e-3, 12)
-    S0s = [get_S0_from_P(P, WAVELENGTH, *soa_params) for P in Pins]
+    print(soa_params[2].shape)
 
-    # try:
-    #     Gs = calc_gain_curve(S0s, I, params)
-
-    #     for P, s, g in zip(Pins, S0s, Gs):
-    #         print(f"P = {P:.2} S0 = {s:.3e}   G = {g:.6e}")
+    calc_cost_param_sweep(S0s, Is, *soa_params, gain, costs, nan_counts)    
 
 
-    #     # Basic sanity checks
-    #     if np.any(~np.isfinite(Gs)):
-    #         raise ValueError("Non-finite gains detected")
+    # for i, W in enumerate(W_range):
+    #     for j, L in enumerate(L_range):
+    #         for k, gamma in enumerate(gamma_range):
+    #             soa_params[5] = W
+    #             soa_params[8] = L
+    #             soa_params[2] = gamma
+    #             Gs = calc_gain_matrix(S0s, Is, p)
 
-    #     if np.any(Gs <= 0):
-    #         raise ValueError("Non-positive gains detected")
+    #             cost = optimization.cost(gain, Gs)
+    #             costs[i,j,k] = cost
+    #             nans[i,j,k] = np.count_nonzero(np.isnan(Gs))
+    #             # print(f"{a:10.2e} {cost}")
 
-    #     print("\nCurve computed successfully:\n")
-    #     print("\nAll tests passed.")
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    scatter = ax.scatter(Ws, gammas, Ls, c=costs, cmap='PRGn')
+    ax.set_xlabel("W")
+    ax.set_ylabel("Gamma")
+    ax.set_zlabel("L")
+    fig.colorbar(scatter, ax=ax)
 
-    # except Exception as e:
-    #     print("\nCurve computation failed:")
-    #     print(e)
+
+    for i, W in enumerate(W_range):
+        for j, L in enumerate(L_range):
+            for k, gamma in enumerate(gamma_range):
+                print(f"{W:10.2e} {L:10.2e} {gamma:.2e} {costs[i,j,k]:10.2e} {nans[i,j,k]}")
+        print()
 
 
-    # # Pin in Watts
-    # # I in mA
-    # def plot_gain_vs_Pin(gain, Pin, I):
-    #     plt.figure()
-    #     plt.semilogy(Pin*1e3, gain, linestyle='', marker='.')
-    #     plt.xlabel("P in [mW]")
-    #     plt.ylabel("Gain (linear)")
-    #     plt.title(f"Gain vs. P_in - I_soa: {I}mA")
+    plt.show()
 
-    # # Pout in Watts
-    # # I in mA
-    # def plot_gain_vs_Pout(gain, Pout, I):
-    #     plt.figure()
-    #     plt.scatter(Pout*1e3, gain)
-    #     plt.xlabel("P out [mW]")
-    #     plt.ylabel("Gain (linear)")
-    #     plt.title(f"Gain vs. P_out - I_soa: {I}mA")
 
-    # plot_gain_vs_Pin(Gs, Pins, I*1e3)
-    # plt.show()
