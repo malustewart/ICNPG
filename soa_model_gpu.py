@@ -1,4 +1,3 @@
-%%writefile soa_parameter_inference/soa_model_gpu.py
 import math
 from scipy.constants import elementary_charge as q  # carga del electron
 from scipy.constants import h
@@ -104,7 +103,7 @@ def solve_gain(
     L,
 ):
 
-    x1 = G_inflection(
+    g_inflection = G_inflection(
         S0,
         I,
         tau_sp,
@@ -118,7 +117,9 @@ def solve_gain(
         L,
     )
 
-    x0 = x1/100
+    x1 = g_inflection if g_inflection > 0 else 500
+
+    x0 = x1/10000
 
     f0 = f(
         x0,
@@ -156,12 +157,16 @@ def solve_gain(
     for _ in range(64):
 
         denom = (f1 - f0)
+        numer = (x1 - x0)
 
         # avoid division by zero
         if abs(denom) < 1e-14:
             return math.nan
 
-        x2 = x1 - f1 * (x1 - x0) / denom
+        step_magnitude = math.exp(math.log(abs(f1)) + math.log(abs(numer)) - math.log(abs(denom)))
+        step_sign =  math.copysign(1.0, f1) * math.copysign(1.0, x1 - x0) * math.copysign(1.0, denom)
+
+        x2 = x1 - step_sign*step_magnitude
 
         f2 = f(
             x2,
@@ -348,20 +353,15 @@ def calc_gain_matrix_param_sweep_kernel(
 def calc_cost_from_gain_matrix_param_sweep_kernel(
     calc_G,
     real_G,
-    S0s,
-    Is,
     costs,
     nan_counts,
 ):
 
     p_idx = cuda.grid(1)
-    
+
     if p_idx >= costs.size:
         return
 
-    N_I = len(Is)
-    N_S0 = len(S0s)
-    
     costs[p_idx] = cost(real_G, calc_G[p_idx])
     nan_counts[p_idx] = count_nan(calc_G[p_idx])
 
@@ -394,7 +394,7 @@ def calc_cost_param_sweep(
     )
 
     # Currently this matrix is not really useful
-    # but is left because it can be used to debug 
+    # but is left because it can be used to debug
     # for which param combos the gain estimation fails
     # (ie.: not only the number of fails but its positions)
     d_nan_mask = cuda.device_array(
@@ -448,7 +448,7 @@ def calc_cost_param_sweep(
         W,
         d,
         L,
-        
+
         d_G_out,
         d_nan_mask
     )
@@ -467,14 +467,11 @@ def calc_cost_param_sweep(
     ](
         d_G_out,
         d_real_G,
-        d_S0s,
-        d_Is,
         d_costs,
         d_nan_counts,
     )
-
     d_costs.copy_to_host(costs)
-    if nan_counts:
+    if nan_counts is not None:
         d_nan_counts.copy_to_host(nan_counts)
 
 
@@ -482,7 +479,7 @@ def calc_cost_param_sweep(
 # TEST
 # ============================================================
 
-if __name__ == "__main__":
+def main():
     I=0.300              # [A]
 
     # Reasonable-ish SOA parameters
@@ -514,9 +511,9 @@ if __name__ == "__main__":
     S0s = get_S0_from_P(Pins, WAVELENGTH, *soa_params)
 
     a_range = np.logspace(-19.52, -19.52, 1)
-    gamma_range = np.logspace(-1, -0.1, 3)
-    W_range = np.logspace(-6, -5, 3)
-    L_range = np.logspace(-4, -3, 3)
+    gamma_range = np.logspace(-1, -0.1, 2)
+    W_range = np.logspace(-6, -5, 2)
+    L_range = np.logspace(-4, -3, 2)
 
     a_s, Ws, Ls, gammas = np.meshgrid(a_range, W_range, L_range, gamma_range, indexing="ij") # indexing: [a,W,L,gamma]
 
@@ -524,8 +521,6 @@ if __name__ == "__main__":
     Ws = Ws.flatten()
     Ls = Ls.flatten()
     gammas = gammas.flatten()
-
-    print(gammas)
 
     costs = np.zeros_like(Ws)
     nan_counts = np.zeros_like(Ws)
@@ -535,41 +530,71 @@ if __name__ == "__main__":
     soa_params[6] = Ws
     soa_params[8] = Ls
 
-
-    print(soa_params[2].shape)
-
-    calc_cost_param_sweep(S0s, Is, *soa_params, gain, costs, nan_counts)    
-
-
-    # for i, W in enumerate(W_range):
-    #     for j, L in enumerate(L_range):
-    #         for k, gamma in enumerate(gamma_range):
-    #             soa_params[5] = W
-    #             soa_params[8] = L
-    #             soa_params[2] = gamma
-    #             Gs = calc_gain_matrix(S0s, Is, p)
-
-    #             cost = optimization.cost(gain, Gs)
-    #             costs[i,j,k] = cost
-    #             nans[i,j,k] = np.count_nonzero(np.isnan(Gs))
-    #             # print(f"{a:10.2e} {cost}")
-
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    scatter = ax.scatter(Ws, gammas, Ls, c=costs, cmap='PRGn')
-    ax.set_xlabel("W")
-    ax.set_ylabel("Gamma")
-    ax.set_zlabel("L")
-    fig.colorbar(scatter, ax=ax)
+    G_matrix = calc_gain_matrix(
+        S0s,
+        Is,
+        soa_params[0],
+        soa_params[1],
+        soa_params[2][-1],
+        soa_params[3][-1],
+        soa_params[4],
+        soa_params[5],
+        soa_params[6][-1],
+        soa_params[7],
+        soa_params[8][-1],
+    )
 
 
-    for i, W in enumerate(W_range):
-        for j, L in enumerate(L_range):
-            for k, gamma in enumerate(gamma_range):
-                print(f"{W:10.2e} {L:10.2e} {gamma:.2e} {costs[i,j,k]:10.2e} {nans[i,j,k]}")
-        print()
+    print(np.nanmax(G_matrix))
+    I_index, S0_index = np.unravel_index(np.nanargmax(G_matrix), G_matrix.shape)
+
+    print(np.count_nonzero(G_matrix<0))
+
+    I_max = Is[I_index]
+    S0_max = S0s[S0_index]
+    Pin_max = Pins[S0_index]
+
+    print(I_index, S0_index)
+    print(I_max, Pin_max)
+
+    print(G_matrix[0,14])
+    c1 = C1(soa_params[0],
+        soa_params[1],
+        soa_params[2][-1],
+        soa_params[3][-1],
+        soa_params[4],
+        soa_params[5],
+        soa_params[6][-1],
+        soa_params[7],
+        soa_params[8][-1],
+    )
+
+    c2 = C2(soa_params[0],
+        soa_params[1],
+        soa_params[2][-1],
+        soa_params[3][-1],
+        soa_params[4],
+        soa_params[5],
+        soa_params[6][-1],
+        soa_params[7],
+        soa_params[8][-1],
+    )
 
 
-    plt.show()
+    # calc_cost_param_sweep(S0s, Is, *soa_params, gain, costs, nan_counts)
 
+    # fig = plt.figure()
+    # ax = fig.add_subplot(111, projection='3d')
+    # scatter = ax.scatter(Ws, gammas, Ls, c=costs, cmap='PRGn')
+    # ax.set_xlabel("W")
+    # ax.set_ylabel("Gamma")
+    # ax.set_zlabel("L")
+    # fig.colorbar(scatter, ax=ax)
 
+    # for a, W, L, gamma, cost_, nan_count in zip(a_s, Ws, Ls, gammas, costs, nan_counts):
+    #     print(f"{a:10.2e} {W:10.2e} {L:10.2e} {gamma:.2e} {cost_:f} {nan_count}")
+
+    # plt.show()
+
+if __name__ == "__main__":
+    main()
