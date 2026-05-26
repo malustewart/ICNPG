@@ -4,3 +4,8 @@ measurement/*/*
 *settings.json
 *.ipynb
 __pycache__/*
+*.o???????
+*.e???????
+*.png
+param_sweep_*.csv
+param_sweep_*.csv
