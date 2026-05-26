@@ -3,8 +3,10 @@ from scipy.optimize import root_scalar
 from scipy.constants import elementary_charge as q  # carga del electron
 from scipy.constants import h
 from scipy.constants import c as c0
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import matplotlib.pyplot as plt
+import optimization
+import time
 
 WAVELENGTH = 1.55e-6
 
@@ -130,8 +132,6 @@ def solve_gain(S0, I, p: SOAParameters):
 
     return np.nan
 
-
-
 def calc_gain_curve(S0s: np.ndarray, I: float, params : SOAParameters):
     """
     Cálculo de G a partir de parámetros del SOA para un conjunto de potencias de entrada S0:
@@ -142,10 +142,39 @@ def calc_gain_curve(S0s: np.ndarray, I: float, params : SOAParameters):
 def calc_gain_matrix(S0s: np.ndarray, Is: np.ndarray, params: SOAParameters):
     return np.array([[solve_gain(S0, I, params) for S0 in S0s] for I in Is])
 
+def calc_cost_param_sweep(
+    S0s,
+    Is,
+    soa_params,
+    gammas,
+    a_s,
+    Ws,
+    Ls,
+    real_G,
+    costs, # for returning output
+    nan_counts = None,  # for returning output
+    timing = False,
+):
 
-# ============================================================
-# TEST
-# ============================================================
+    if timing:  #warmup
+        for i in range (3): # warmup
+            Gs = calc_gain_matrix(S0s, Is, soa_params)
+            cost = optimization.cost(real_G, Gs)
+            costs[i] = cost
+            nan_counts[i] = np.count_nonzero(np.isnan(Gs))
+    
+    start = time.perf_counter()
+    for i, (S0, gamma, a, W, L) in enumerate(zip(S0s, gammas, a_s, Ws, Ls)):
+        p = replace(soa_params, L=L, W=W, Gamma=gamma, a=a)
+        Gs = calc_gain_matrix(S0, Is, soa_params)
+
+        cost = optimization.cost(real_G, Gs)
+        costs[i] = cost
+        nan_counts[i] = np.count_nonzero(np.isnan(Gs))
+    
+    end = time.perf_counter()
+    return (end - start) * 1000 # to ms
+
 
 if __name__ == "__main__":
 
@@ -210,24 +239,3 @@ if __name__ == "__main__":
         print("\nCurve computation failed:")
         print(e)
 
-
-    # Pin in Watts
-    # I in mA
-    def plot_gain_vs_Pin(gain, Pin, I):
-        plt.figure()
-        plt.semilogy(Pin*1e3, gain, linestyle='', marker='.')
-        plt.xlabel("P in [mW]")
-        plt.ylabel("Gain (linear)")
-        plt.title(f"Gain vs. P_in - I_soa: {I}mA")
-
-    # Pout in Watts
-    # I in mA
-    def plot_gain_vs_Pout(gain, Pout, I):
-        plt.figure()
-        plt.scatter(Pout*1e3, gain)
-        plt.xlabel("P out [mW]")
-        plt.ylabel("Gain (linear)")
-        plt.title(f"Gain vs. P_out - I_soa: {I}mA")
-
-    plot_gain_vs_Pin(Gs, Pins, I*1e3)
-    plt.show()

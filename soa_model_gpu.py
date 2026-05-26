@@ -7,6 +7,7 @@ from numba import cuda
 import numpy as np
 from optimization_gpu import cost, count_nan
 
+
 WAVELENGTH = 1.55e-6
 
 # SOA PARAMETERS:
@@ -136,6 +137,7 @@ def solve_gain(
         L,
     )
 
+    G_MAX = 1000
     f1 = f(
         x1,
         S0,
@@ -158,16 +160,12 @@ def solve_gain(
 
         denom = (f1 - f0)
         numer = (x1 - x0)
-
         # avoid division by zero
         if abs(denom) < 1e-14:
             return math.nan
-
         step_magnitude = math.exp(math.log(abs(f1)) + math.log(abs(numer)) - math.log(abs(denom)))
         step_sign =  math.copysign(1.0, f1) * math.copysign(1.0, x1 - x0) * math.copysign(1.0, denom)
-
         x2 = x1 - step_sign*step_magnitude
-
         f2 = f(
             x2,
             S0,
@@ -182,22 +180,17 @@ def solve_gain(
             d,
             L,
         )
-
         if math.isnan(f2):
             return math.nan
-
         # convergence test
         if abs(f2) < 1e-10:
             return x2
-
         # shift iteration
         x0 = x1
         f0 = f1
-
         x1 = x2
         f1 = f2
-
-    return x1
+    return x1 if x1 < G_MAX else math.nan
 
 @cuda.jit
 def calc_gain_matrix_kernel(
@@ -239,7 +232,7 @@ def calc_gain_matrix_kernel(
         L,
     )
 
-    G_out[i, j] = G
+    G_out[i, j] = G if G < 1e4 else math.nan
 
 def calc_gain_matrix(
     S0s,
@@ -378,15 +371,52 @@ def calc_cost_param_sweep(
     alpha_int,
     vg,
     W,  #array
-    d,  #array
-    L,
+    d,
+    L,  #array
     real_G,
     costs, # for returning output
-    nan_counts = None  # for returning output
+    nan_counts = None,  # for returning output
+    timing = False,
 ):
     N_params = len(Gamma)
     N_I = len(Is)
     N_S0 = len(S0s)
+
+
+    if timing:  
+        ############ warm-up ############
+
+        # Force CUDA context creation + JIT warmup
+        cuda.synchronize()
+        _ = cuda.device_array(1, dtype=np.float64)
+        dummy_arr = cuda.to_device(np.array([0.0]))
+
+        calc_gain_matrix_param_sweep_kernel[
+            (1, 1, 1),
+            (1, 1, 1)
+        ](
+            dummy_arr,
+            dummy_arr,
+
+            tau_sp,
+            n0,
+            np.array([Gamma[0]]),
+            np.array([a[0]]),
+            alpha_int,
+            vg,
+            np.array([W[0]]),
+            d,
+            np.array([L[0]]),
+            cuda.device_array((1, 1, 1), dtype=np.float64),
+            cuda.device_array((1, 1, 1), dtype=np.bool_)
+        )
+        cuda.synchronize()
+
+    ############ start timers ############
+    start = cuda.event()
+    end = cuda.event()
+
+    start.record()
 
     d_G_out = cuda.device_array(
         (N_params, N_I, N_S0),
@@ -402,24 +432,14 @@ def calc_cost_param_sweep(
         dtype=np.bool_,
     )
 
-    d_costs = cuda.device_array(
-        N_params,
-        dtype=np.float64,
-    )
-
-    d_nan_counts = cuda.device_array(
-        N_params,
-        dtype=np.float64,
-    )
-
     d_S0s = cuda.to_device(S0s)
     d_Is = cuda.to_device(Is)
     d_real_G = cuda.to_device(real_G)
 
-    d_Gamma_vals = cuda.to_device(Gamma)
-    d_a_vals = cuda.to_device(a)
-    d_W_vals = cuda.to_device(W)
-    d_d_vals = cuda.to_device(d)
+    d_Gamma = cuda.to_device(Gamma)
+    d_a = cuda.to_device(a)
+    d_W = cuda.to_device(W)
+    d_L = cuda.to_device(L)
 
     # launch first kernel to calc gains for all param combinations
     # divide threads in 3D: (param_combination, I, S0)
@@ -441,160 +461,105 @@ def calc_cost_param_sweep(
 
         tau_sp,
         n0,
-        Gamma,
-        a,
+        d_Gamma,
+        d_a,
         alpha_int,
         vg,
-        W,
+        d_W,
         d,
-        L,
+        d_L,
 
         d_G_out,
         d_nan_mask
     )
 
     cuda.synchronize()
+    
+    ############ stop timers ############
+    end.record()
+    elapsed_ms_kernel_1 = cuda.event_elapsed_time(start, end)
+
+    if timing: 
+    
+        ############ warm up second kernel ############
+        warmup_S0s = np.array([0.0], dtype=np.float64)
+        warmup_Is = np.array([0.0], dtype=np.float64)
+
+        warmup_Gamma = np.array([Gamma[0]], dtype=np.float64)
+        warmup_a = np.array([a[0]], dtype=np.float64)
+        warmup_W = np.array([W[0]], dtype=np.float64)
+        warmup_L = np.array([L[0]], dtype=np.float64)
+
+        d_warmup_S0s = cuda.to_device(warmup_S0s)
+        d_warmup_Is = cuda.to_device(warmup_Is)
+
+        d_warmup_G_out = cuda.device_array(
+            (1, 1, 1),
+            dtype=np.float64,
+        )
+
+        d_warmup_nan_mask = cuda.device_array(
+            (1, 1, 1),
+            dtype=np.bool_,
+        )
+
+        calc_gain_matrix_param_sweep_kernel[
+            (1, 1, 1),
+            (1, 1, 1)
+        ](
+            d_warmup_S0s,
+            d_warmup_Is,
+
+            tau_sp,
+            n0,
+            warmup_Gamma,
+            warmup_a,
+            alpha_int,
+            vg,
+            warmup_W,
+            d,
+            warmup_L,
+
+            d_warmup_G_out,
+            d_warmup_nan_mask
+        )
+
+        cuda.synchronize()
+    d_costs = cuda.device_array(
+        N_params,
+        dtype=np.float64,
+    )
+
+    d_nan_counts = cuda.device_array(
+        N_params,
+        dtype=np.float64,
+    )
+
 
     # launch second kernel to calculate the cost function for all parameter combinations
     # divide threads in 1D: (param_combination)
     threads_per_block = (256,)
     blocks_per_grid = (
-        (N_params + threads_per_block[0] - 1), # threads_per_block[0],
+        (N_params + threads_per_block[0] - 1),
     )
     calc_cost_from_gain_matrix_param_sweep_kernel[
-        threads_per_block,
-        blocks_per_grid
+        blocks_per_grid,
+        threads_per_block
     ](
         d_G_out,
         d_real_G,
         d_costs,
         d_nan_counts,
     )
+
     d_costs.copy_to_host(costs)
+
     if nan_counts is not None:
         d_nan_counts.copy_to_host(nan_counts)
 
+    ############ stop timers ############
+    end.record()
 
-# ============================================================
-# TEST
-# ============================================================
+    elapsed_ms_kernel_2 = cuda.event_elapsed_time(start, end)
 
-def main():
-    I=0.300              # [A]
-
-    # Reasonable-ish SOA parameters
-    soa_params = [
-        1e-9,   #tau_sp [s]
-        1e24,   #n0
-        0.3,    #Gamma
-        3e-20,  #a
-        1000,   #alpha_int [1/m]
-        8e7,    #vg [m/s]
-        2e-6,   #W [m]
-        0.2e-6, #d [m]
-        500e-6  #L [m]
-    ]
-
-    gain_map = np.load('measurement/processed/soa_2d_gain_map.npz')
-
-    Is = gain_map["soa_current_mA"] * 1e-3
-    Pins = gain_map["input_power_W"]
-    gain = gain_map["gain_linear"]
-
-    # fix dataset with numerical errors at edges that include nan
-    Pin_range = slice(1,len(Pins) - 1)
-    Is_range = slice(4,len(Is))
-
-    gain = gain[Is_range, Pin_range].copy() #copy is necessary so that memory is contiguous (which does not happen if working with view)
-    Is = Is[Is_range].copy()
-    Pins = Pins[Pin_range].copy()
-    S0s = get_S0_from_P(Pins, WAVELENGTH, *soa_params)
-
-    a_range = np.logspace(-19.52, -19.52, 1)
-    gamma_range = np.logspace(-1, -0.1, 2)
-    W_range = np.logspace(-6, -5, 2)
-    L_range = np.logspace(-4, -3, 2)
-
-    a_s, Ws, Ls, gammas = np.meshgrid(a_range, W_range, L_range, gamma_range, indexing="ij") # indexing: [a,W,L,gamma]
-
-    a_s = a_s.flatten()
-    Ws = Ws.flatten()
-    Ls = Ls.flatten()
-    gammas = gammas.flatten()
-
-    costs = np.zeros_like(Ws)
-    nan_counts = np.zeros_like(Ws)
-
-    soa_params[2] = gammas
-    soa_params[3] = a_s
-    soa_params[6] = Ws
-    soa_params[8] = Ls
-
-    G_matrix = calc_gain_matrix(
-        S0s,
-        Is,
-        soa_params[0],
-        soa_params[1],
-        soa_params[2][-1],
-        soa_params[3][-1],
-        soa_params[4],
-        soa_params[5],
-        soa_params[6][-1],
-        soa_params[7],
-        soa_params[8][-1],
-    )
-
-
-    print(np.nanmax(G_matrix))
-    I_index, S0_index = np.unravel_index(np.nanargmax(G_matrix), G_matrix.shape)
-
-    print(np.count_nonzero(G_matrix<0))
-
-    I_max = Is[I_index]
-    S0_max = S0s[S0_index]
-    Pin_max = Pins[S0_index]
-
-    print(I_index, S0_index)
-    print(I_max, Pin_max)
-
-    print(G_matrix[0,14])
-    c1 = C1(soa_params[0],
-        soa_params[1],
-        soa_params[2][-1],
-        soa_params[3][-1],
-        soa_params[4],
-        soa_params[5],
-        soa_params[6][-1],
-        soa_params[7],
-        soa_params[8][-1],
-    )
-
-    c2 = C2(soa_params[0],
-        soa_params[1],
-        soa_params[2][-1],
-        soa_params[3][-1],
-        soa_params[4],
-        soa_params[5],
-        soa_params[6][-1],
-        soa_params[7],
-        soa_params[8][-1],
-    )
-
-
-    # calc_cost_param_sweep(S0s, Is, *soa_params, gain, costs, nan_counts)
-
-    # fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-    # scatter = ax.scatter(Ws, gammas, Ls, c=costs, cmap='PRGn')
-    # ax.set_xlabel("W")
-    # ax.set_ylabel("Gamma")
-    # ax.set_zlabel("L")
-    # fig.colorbar(scatter, ax=ax)
-
-    # for a, W, L, gamma, cost_, nan_count in zip(a_s, Ws, Ls, gammas, costs, nan_counts):
-    #     print(f"{a:10.2e} {W:10.2e} {L:10.2e} {gamma:.2e} {cost_:f} {nan_count}")
-
-    # plt.show()
-
-if __name__ == "__main__":
-    main()
+    return (elapsed_ms_kernel_1, elapsed_ms_kernel_2)
